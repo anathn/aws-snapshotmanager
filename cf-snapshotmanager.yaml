@@ -1,0 +1,170 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  ManageSnapshotsFeature:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaSnapshotManagementRole.Arn
+      Runtime: "python3.6"
+
+      Code:
+        ZipFile: |
+          import boto3
+          from time import strftime
+          from datetime import datetime
+
+          ec = boto3.client('ec2')
+          ec2r = boto3.resource('ec2')
+          tag_names = ['snapshot', 'Snapshot', 'SNAPSHOT']
+          expire_snapshot_times = ['01:00', '11:00']
+          default_retention = 30
+
+
+          def expire_snapshots(instance, retention_number):
+              volume_ids = []
+              for volume in instance['BlockDeviceMappings']:
+                  volume_id = volume['Ebs']['VolumeId']
+                  volume_ids.append(volume_id)
+              retention_number = retention_number * len(volume_ids)
+              snapshots = ec2r.snapshots.filter(
+                  Filters =[
+                      {
+                          'Name': 'volume-id',
+                          'Values': volume_ids
+                      }
+                  ]).all()
+              snapshots = sorted(snapshots, key=lambda ss: ss.start_time, reverse=True)
+              total_snapshots = 0
+              for snapshot in snapshots:
+
+                  total_snapshots += 1
+
+                  if snapshot.tags is not None:
+                      for tag in snapshot.tags:
+                          if tag['Key'].lower() == 'preserve_snapshot':
+                              total_snapshots -= 1
+                              try:
+                                  purge_date = datetime.strptime(
+                                      tag['Value'], "%Y-%m-%d")
+                              except ValueError:
+                                  continue
+
+                              if purge_date < datetime.now():
+                                  print("Deleteing snapshot: {0}".format(snapshot.id))
+                                  snapshot.delete()
+                  if total_snapshots > retention_number:
+                      print("Deleteing snapshot: {0}".format(snapshot.id))
+                      snapshot.delete()
+
+
+          def lambda_handler(event, context):
+              current_time = strftime("%H:%M")
+              print ("Current Time: %s" % current_time)
+              reservations = ec.describe_instances(
+                  Filters=[
+                      {'Name': 'tag-key', 'Values': tag_names},
+                  ]
+              ).get(
+                  'Reservations', []
+              )
+
+              instances = sum(
+                  [
+                      [i for i in r['Instances']]
+                      for r in reservations
+                  ], [])
+
+              print ("Checking %d instances..." % len(instances))
+
+              for instance in instances:
+                  lower_tags = {tag['Key'].lower():  tag['Value'].lower() for tag in instance['Tags']}
+                  params = lower_tags['snapshot'].replace('(','').split(')')
+                  if len(params) != 2:
+                      print("ERROR: Invalid snapshot tag on instance {0}: {1}".format(
+                          instance['InstanceId'], lower_tags['snapshot']))
+
+                  trigger_times = [tm.strip() for tm in params[0].split(',')]
+                  try:
+                      retention_number = int(params[1])
+                  except ValueError:
+                      retention_number = default_retention
+                  instance_name = ''
+
+                  if 'name' in lower_tags:
+                      instance_name = lower_tags['name']
+
+                  if current_time not in trigger_times:
+                      print ("Skipping %s" % instance['InstanceId'])
+                      expire_snapshots(instance, retention_number)
+                      continue
+
+                  for dev in instance['BlockDeviceMappings']:
+                      if dev.get('Ebs', None) is None:
+                          continue
+
+                      vol_id = dev['Ebs']['VolumeId']
+                      print ("Found EBS volume %s on instance %s" % (
+                          vol_id, instance['InstanceId']))
+
+                      result = ec.create_snapshot(
+                          VolumeId=vol_id,
+                          Description="{0}   Created from {1}: vol: {2}".format(instance_name, instance['InstanceId'], vol_id).strip()
+                      )
+
+                      if len(instance_name.strip()) > 0:
+                          ec2resource = boto3.resource('ec2')
+                          snapshot = ec2resource.Snapshot(result['SnapshotId'])
+                          snapshot.create_tags(Tags=[{'Key': 'Name', 'Value': instance_name}])
+
+  LambdaSnapshotManagementRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: snapshot-manager
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+              - ec2:CreateSnapshot
+              - ec2:CreateTages
+              - ec2:DescribeSnapshots
+              - ec2:DeleteSnapshot
+              - ec2:DeleteTags
+              - ec2:DescribeInstances
+              - ec2:DescribeSnapshotAttribute
+              - ec2:DescribeTags
+              - ec2:DescribeVolumeAttribute
+              - ec2:DescribeVolumeStatus
+              - ec2:DescribeVolumes
+              - ec2:ModifySnapshotAttribute
+              - ec2:ModifyVolumeAttribute
+              - ec2:ResetSnapshotAttribute
+            Resource: "*"
+  ScheduleRule:
+    Type: "AWS::Events::Rule"
+    Properties:
+      Description: "Trigers Snapshot Management Lambdas"
+      ScheduleExpression: "rate(1 minute)"
+      State: "ENABLED"
+      Targets:
+        -
+          Arn: !GetAtt ManageSnapshotsFeature.Arn
+          Id: "TargetCreateSnapshotsFunction"
+  PermissionsToInvokeLambda:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      FunctionName: !Ref "ManageSnapshotsFeature"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt ScheduleRule.Arn
